@@ -3,7 +3,12 @@ import type { PGlite } from '../pglite.js'
 import { dumpTar, type DumpTarCompressionOptions } from './tarUtils.js'
 import { PGDATA } from '../initdb.js'
 
-export type FsType = 'nodefs' | 'idbfs' | 'memoryfs' | 'opfs-ahp'
+export type FsType =
+  | 'nodefs'
+  | 'idbfs'
+  | 'memoryfs'
+  | 'opfs-ahp'
+  | 'opfs-packed'
 
 /**
  * Filesystem interface.

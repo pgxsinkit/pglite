@@ -1,6 +1,6 @@
 {
   "name": "@pgxsinkit/pglite",
-  "version": "0.5.4-pgx.0",
+  "version": "0.5.4-pgx.1",
   "private": false,
   "publishConfig": {
     "access": "public",
@@ -79,6 +79,16 @@
       "require": {
         "types": "./dist/fs/opfs-ahp.d.cts",
         "default": "./dist/fs/opfs-ahp.cjs"
+      }
+    },
+    "./opfs-packed": {
+      "import": {
+        "types": "./dist/fs/opfs-packed.d.ts",
+        "default": "./dist/fs/opfs-packed.js"
+      },
+      "require": {
+        "types": "./dist/fs/opfs-packed.d.cts",
+        "default": "./dist/fs/opfs-packed.cjs"
       }
     },
     "./basefs": {
