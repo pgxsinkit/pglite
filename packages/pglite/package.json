@@ -1,10 +1,9 @@
 {
   "name": "@pgxsinkit/pglite",
-  "version": "0.5.4-pgx.2",
+  "version": "0.5.4-pgx.3",
   "private": false,
   "publishConfig": {
-    "access": "public",
-    "registry": "https://npm.pkg.github.com"
+    "access": "public"
   },
   "description": "PGlite is a WASM Postgres build packaged into a TypeScript client library that enables you to run Postgres in the browser, Node.js and Bun, with no need to install any other dependencies. It is only 3.7mb gzipped.",
   "keywords": [
