@@ -21,7 +21,7 @@ import type {
 import PostgresModFactory, { type PostgresMod } from './postgresMod.js'
 
 // Importing the source as the built version is not ESM compatible
-import { Parser as ProtocolParser, serialize } from '@electric-sql/pg-protocol'
+import { Parser as ProtocolParser } from '@electric-sql/pg-protocol'
 import {
   BackendMessage,
   DatabaseError,
@@ -98,6 +98,8 @@ export class PGlite
   #listenMutex = new Mutex()
   #fsSyncMutex = new Mutex()
   #fsSyncScheduled = false
+  #pendingFsSync?: Promise<void>
+  #fsSyncFailure?: { error: unknown }
 
   readonly debug: DebugLevel = 0
 
@@ -221,7 +223,10 @@ export class PGlite
     this.#extensions = options.extensions ?? {}
 
     // Initialize the database, and store the promise so we can wait for it to be ready
-    this.waitReady = this.#init(options ?? {})
+    this.waitReady = this.#init(options ?? {}).catch(async (error) => {
+      await this.#cleanupFailedInit()
+      throw error
+    })
   }
 
   /**
@@ -527,7 +532,7 @@ export class PGlite
     this.mod = await PostgresModFactory(emscriptenOpts)
 
     // Sync the filesystem from any previous store
-    await this.fs!.initialSyncFs()
+    await this.#initialSyncFs()
 
     if (options.icuDataDir) {
       await this.#fillIcuDataDir(options.icuDataDir)
@@ -584,7 +589,7 @@ export class PGlite
 
           // Sync any changes back to the persisted store (if there is one)
           // TODO: only sync here if initdb did init db.
-          await this.syncToFs()
+          await this.#syncToFsStrict()
         }
       }
       // Start compiling dynamic extensions present in FS.
@@ -614,6 +619,81 @@ export class PGlite
       // Init extensions
       for (const initFn of extensionInitFns) {
         await initFn()
+      }
+    }
+  }
+
+  async #cleanupFailedInit() {
+    const mod = this.mod
+
+    try {
+      await this.#waitForPendingFsSync()
+    } catch {
+      // Initialization already failed; only wait for storage work to settle.
+    }
+    await this.#fsSyncMutex.runExclusive(async () => {})
+
+    if (mod) {
+      for (const functionPointer of [
+        this.#pglite_socket_read,
+        this.#pglite_socket_write,
+      ]) {
+        if (functionPointer < 0) continue
+        try {
+          mod.removeFunction(functionPointer)
+        } catch {
+          // Continue releasing filesystem and runtime resources.
+        }
+      }
+    }
+
+    try {
+      await this.fs?.cleanupFailedInit?.()
+    } catch {
+      // Preserve the initialization error that made the instance unusable.
+    } finally {
+      if (mod) {
+        try {
+          mod._emscripten_force_exit(/* exit code */ 1)
+        } catch {
+          // The runtime normally reports forced exit by throwing ExitStatus.
+        }
+      }
+      this.#closed = true
+      this.#ready = false
+      this.#running = false
+    }
+  }
+
+  async #initialSyncFs() {
+    const pendingSync = this.fs!.initialSyncFs()
+    if (!this.fs!.syncRequiresExclusiveExecution) {
+      await pendingSync
+      return
+    }
+
+    this.#pendingFsSync = pendingSync
+    try {
+      await pendingSync
+    } finally {
+      if (this.#pendingFsSync === pendingSync) {
+        this.#pendingFsSync = undefined
+      }
+    }
+  }
+
+  async #syncToFsStrict() {
+    const pendingSync = this.#fsSyncMutex.runExclusive(() =>
+      this.fs!.syncToFs(false),
+    )
+    if (this.fs!.syncRequiresExclusiveExecution) {
+      this.#pendingFsSync = pendingSync
+    }
+    try {
+      await pendingSync
+    } finally {
+      if (this.#pendingFsSync === pendingSync) {
+        this.#pendingFsSync = undefined
       }
     }
   }
@@ -787,61 +867,90 @@ export class PGlite
   async close() {
     await this._checkReady()
     this.#closing = true
+    let closeFailure: { error: unknown } | undefined
+    let finalSyncFailure: { error: unknown } | undefined
 
-    // Close all extensions
-    for (const closeFn of this.#extensionsClose) {
-      await closeFn()
-    }
-
-    // Close the database
     try {
-      this.mod!._pgl_setPGliteActive(0)
-      await this.execProtocol(serialize.end())
-      this.mod!._pgl_run_atexit_funcs()
-    } catch (e: any) {
-      const err = e as { name: string; status: number }
-      if (err.name === 'ExitStatus' && err.status === 0) {
-        // Database closed successfully
-        // An earlier build of PGlite would throw an error here when closing
-        // leaving this here for now. I believe it was a bug in Emscripten.
-      } else {
-        this.#log(`An error occured while closing the db`, e.toString())
-      }
+      await this.#transactionMutex.runExclusive(async () => {
+        await this.#queryMutex.runExclusive(async () => {
+          try {
+            await this.#waitForPendingFsSync()
+          } catch (error) {
+            finalSyncFailure = { error }
+          }
+
+          // A close hook may access Module.FS directly, so run hooks only
+          // after any previous exclusive filesystem snapshot has settled.
+          for (const closeFn of this.#extensionsClose) {
+            try {
+              await closeFn()
+            } catch (error) {
+              closeFailure ??= { error }
+            }
+          }
+
+          // Close the database
+          try {
+            this.mod!._pgl_setPGliteActive(0)
+            this.mod!._pgl_run_atexit_funcs()
+          } catch (e: any) {
+            const err = e as { name: string; status: number }
+            if (err.name === 'ExitStatus' && err.status === 0) {
+              // Database closed successfully
+              // An earlier build of PGlite would throw an error here when closing
+              // leaving this here for now. I believe it was a bug in Emscripten.
+            } else {
+              this.#log(`An error occured while closing the db`, e.toString())
+            }
+          }
+
+          // Persist shutdown and atexit mutations with strict durability. A
+          // successful final sync also recovers a prior background failure.
+          try {
+            await this.#syncToFsStrict()
+            finalSyncFailure = undefined
+            this.#fsSyncFailure = undefined
+          } catch (error) {
+            finalSyncFailure = { error }
+            this.#fsSyncFailure = { error }
+          }
+        })
+      })
     } finally {
       this.mod!.removeFunction(this.#pglite_socket_read)
       this.mod!.removeFunction(this.#pglite_socket_write)
+
+      try {
+        // Close the filesystem even if shutdown or persistence failed so that
+        // exclusive storage ownership is always released.
+        await this.fs!.closeFs()
+      } finally {
+        this.#closed = true
+        this.#closing = false
+        this.#ready = false
+        this.#running = false
+
+        try {
+          // exit the runtime. since we're using `noExitRuntime: true` on our module,
+          // we need to do this explicitly
+          this.mod!._emscripten_force_exit(0)
+        } catch (e: any) {
+          this.#log(e)
+          if (e.status !== 0) {
+            this.#log('Error when exiting', e.toString())
+          }
+        } finally {
+          // clear mod to release memory
+          this.mod = undefined
+        }
+      }
     }
 
-    // Drain any in-flight relaxed-durability sync and perform a final strict
-    // sync before closing the filesystem. With relaxedDurability the last
-    // syncToFs() is fire-and-forget, so a sync can still be running against the
-    // filesystem here; the mutex serialises with it (waiting it out) and the
-    // strict syncToFs(false) guarantees the tail writes persist. This closes
-    // the race between an in-flight relaxed sync and closeFs() — on IdbFs the
-    // in-flight sync would otherwise open a transaction on an already-closing
-    // IDBDatabase connection.
-    await this.#fsSyncMutex.runExclusive(() => this.fs!.syncToFs(false))
-
-    // Close the filesystem
-    await this.fs!.closeFs()
-
-    this.#closed = true
-    this.#closing = false
-    this.#ready = false
-    this.#running = false
-
-    try {
-      // exit the runtime. since we're using `noExitRuntime: true` on our module,
-      // we need to do this explicitly
-      this.mod!._emscripten_force_exit(0)
-    } catch (e: any) {
-      this.#log(e)
-      if (e.status !== 0) {
-        this.#log('Error when exiting', e.toString())
-      }
-    } finally {
-      // clear mod to release memory
-      this.mod = undefined
+    if (finalSyncFailure) {
+      throw finalSyncFailure.error
+    }
+    if (closeFailure !== undefined) {
+      throw closeFailure.error
     }
   }
 
@@ -905,6 +1014,7 @@ export class PGlite
    * @returns The direct message data response produced by Postgres
    */
   execProtocolRawSync(message: Uint8Array) {
+    this.#checkSynchronousFsSyncState()
     const mod = this.mod!
 
     this.#readOffset = 0
@@ -975,6 +1085,27 @@ export class PGlite
     return new Uint8Array(0)
   }
 
+  #checkSynchronousFsSyncState() {
+    this.#checkOpenState()
+    if (this.#pendingFsSync) {
+      throw new Error(
+        'Cannot execute synchronously while a filesystem sync is pending',
+      )
+    }
+    if (this.#fsSyncFailure) {
+      throw this.#fsSyncFailure.error
+    }
+  }
+
+  #checkOpenState() {
+    if (this.#closing) {
+      throw new Error('PGlite is closing')
+    }
+    if (this.#closed) {
+      throw new Error('PGlite is closed')
+    }
+  }
+
   /**
    * Execute a postgres wire protocol message directly without wrapping the response.
    * Only use if `execProtocol()` doesn't suite your needs.
@@ -990,6 +1121,7 @@ export class PGlite
     message: Uint8Array,
     { syncToFs = true }: ExecProtocolOptions = {},
   ) {
+    await this.#waitForPendingFsSync()
     const data = this.execProtocolRawSync(message)
     if (syncToFs) {
       await this.syncToFs()
@@ -1012,6 +1144,7 @@ export class PGlite
     message: Uint8Array,
     { syncToFs = true, onRawData }: ExecProtocolOptionsStream,
   ) {
+    await this.#waitForPendingFsSync()
     this.#onData = (bytes: Uint8Array) => {
       onRawData(bytes)
       return bytes.length
@@ -1142,22 +1275,82 @@ export class PGlite
    * run after every query to ensure that the filesystem is synced.
    */
   async syncToFs() {
+    this.#checkOpenState()
+    if (this.#fsSyncFailure) {
+      throw this.#fsSyncFailure.error
+    }
     if (this.#fsSyncScheduled) {
+      if (!this.#relaxedDurability) {
+        await this.#waitForPendingFsSync()
+      }
       return
     }
     this.#fsSyncScheduled = true
+    const requiresExclusiveExecution =
+      this.fs!.syncRequiresExclusiveExecution === true
 
     const doSync = async () => {
-      await this.#fsSyncMutex.runExclusive(async () => {
-        this.#fsSyncScheduled = false
-        await this.fs!.syncToFs(this.#relaxedDurability)
-      })
+      try {
+        await this.#fsSyncMutex.runExclusive(async () => {
+          if (!requiresExclusiveExecution) {
+            this.#fsSyncScheduled = false
+          }
+          await this.fs!.syncToFs(this.#relaxedDurability)
+        })
+      } finally {
+        if (requiresExclusiveExecution) {
+          this.#fsSyncScheduled = false
+        }
+      }
     }
 
-    if (this.#relaxedDurability) {
-      doSync()
+    if (requiresExclusiveExecution) {
+      const pendingSync = doSync()
+      this.#pendingFsSync = pendingSync
+      void pendingSync.then(
+        () => {
+          if (this.#pendingFsSync === pendingSync) {
+            this.#pendingFsSync = undefined
+          }
+        },
+        (error) => {
+          if (this.#pendingFsSync === pendingSync) {
+            this.#pendingFsSync = undefined
+          }
+          this.#fsSyncFailure ??= { error }
+        },
+      )
+      if (!this.#relaxedDurability) {
+        try {
+          await pendingSync
+        } catch (error) {
+          this.#fsSyncFailure ??= { error }
+          throw error
+        }
+      }
+    } else if (this.#relaxedDurability) {
+      void doSync()
     } else {
-      await doSync()
+      try {
+        await doSync()
+      } catch (error) {
+        this.#fsSyncFailure ??= { error }
+        throw error
+      }
+    }
+  }
+
+  async #waitForPendingFsSync() {
+    const pendingSync = this.#pendingFsSync
+    if (pendingSync) {
+      try {
+        await pendingSync
+      } catch (error) {
+        this.#fsSyncFailure ??= { error }
+      }
+    }
+    if (this.#fsSyncFailure) {
+      throw this.#fsSyncFailure.error
     }
   }
 
@@ -1286,7 +1479,10 @@ export class PGlite
    * @returns The result of the query
    */
   _runExclusiveQuery<T>(fn: () => Promise<T>): Promise<T> {
-    return this.#queryMutex.runExclusive(fn)
+    return this.#queryMutex.runExclusive(async () => {
+      await this.#waitForPendingFsSync()
+      return await fn()
+    })
   }
 
   /**
@@ -1309,6 +1505,7 @@ export class PGlite
   }
 
   callMain(args: string[]): number {
+    this.#checkSynchronousFsSyncState()
     return this.mod!.callMain(args)
   }
 
@@ -1359,6 +1556,7 @@ export class PGlite
   }
 
   copyToFS(filePath: string, data: Uint8Array, mode?: number) {
+    this.#checkSynchronousFsSyncState()
     copyToFS(this.mod!.FS, filePath, data, mode)
   }
 }

@@ -32,6 +32,27 @@ export function tests(env, dbFilename, target) {
       `)
     }
 
+    async function cleanupLiveWorkers(page2) {
+      if (dbFilename.startsWith('idb://')) {
+        await evaluate(async () => {
+          await window.testWorkerDb.close()
+        })
+      }
+      await Promise.all([
+        evaluate(() => {
+          window.testWorker.terminate()
+          delete window.testWorkerDb
+          delete window.testWorker
+        }),
+        page2.evaluate(() => {
+          window.testWorker.terminate()
+          delete window.testWorkerDb
+          delete window.testWorker
+        }),
+      ])
+      await page2.close()
+    }
+
     afterAll(async () => {
       if (browser) {
         await browser.close()
@@ -210,6 +231,9 @@ export function tests(env, dbFilename, target) {
         const res = await db.query(`
           SELECT * FROM test;
         `)
+        if (dbFilename.startsWith('idb://')) {
+          await db.close()
+        }
         return res
       })
 
@@ -250,16 +274,15 @@ export function tests(env, dbFilename, target) {
         const { live } = await import(PGLITE_LIVE_PATH)
         const { PGliteWorker } = await import(PGLITE_WORKER_PATH)
 
-        let db
-        db = new PGliteWorker(
-          new Worker(WORKER_PATH, {
-            type: 'module',
-          }),
-          {
-            dataDir: window.dbFilename,
-            extensions: { live },
-          },
-        )
+        const worker = new Worker(WORKER_PATH, {
+          type: 'module',
+        })
+        const db = new PGliteWorker(worker, {
+          dataDir: window.dbFilename,
+          extensions: { live },
+        })
+        window.testWorker = worker
+        window.testWorkerDb = db
 
         await db.waitReady
 
@@ -283,16 +306,15 @@ export function tests(env, dbFilename, target) {
         const { live } = await import(PGLITE_LIVE_PATH)
         const { PGliteWorker } = await import(PGLITE_WORKER_PATH)
 
-        let db
-        db = new PGliteWorker(
-          new Worker(WORKER_PATH, {
-            type: 'module',
-          }),
-          {
-            dataDir: window.dbFilename,
-            extensions: { live },
-          },
-        )
+        const worker = new Worker(WORKER_PATH, {
+          type: 'module',
+        })
+        const db = new PGliteWorker(worker, {
+          dataDir: window.dbFilename,
+          extensions: { live },
+        })
+        window.testWorker = worker
+        window.testWorkerDb = db
 
         await db.waitReady
 
@@ -343,6 +365,8 @@ export function tests(env, dbFilename, target) {
           },
         ])
       }
+
+      await cleanupLiveWorkers(page2)
     })
 
     it(`worker live incremental query`, async () => {
@@ -357,16 +381,15 @@ export function tests(env, dbFilename, target) {
         const { live } = await import(PGLITE_LIVE_PATH)
         const { PGliteWorker } = await import(PGLITE_WORKER_PATH)
 
-        let db
-        db = new PGliteWorker(
-          new Worker(WORKER_PATH, {
-            type: 'module',
-          }),
-          {
-            dataDir: window.dbFilename,
-            extensions: { live },
-          },
-        )
+        const worker = new Worker(WORKER_PATH, {
+          type: 'module',
+        })
+        const db = new PGliteWorker(worker, {
+          dataDir: window.dbFilename,
+          extensions: { live },
+        })
+        window.testWorker = worker
+        window.testWorkerDb = db
 
         await db.waitReady
 
@@ -391,16 +414,15 @@ export function tests(env, dbFilename, target) {
         const { live } = await import(PGLITE_LIVE_PATH)
         const { PGliteWorker } = await import(PGLITE_WORKER_PATH)
 
-        let db
-        db = new PGliteWorker(
-          new Worker(WORKER_PATH, {
-            type: 'module',
-          }),
-          {
-            dataDir: window.dbFilename,
-            extensions: { live },
-          },
-        )
+        const worker = new Worker(WORKER_PATH, {
+          type: 'module',
+        })
+        const db = new PGliteWorker(worker, {
+          dataDir: window.dbFilename,
+          extensions: { live },
+        })
+        window.testWorker = worker
+        window.testWorkerDb = db
 
         await db.waitReady
 
@@ -460,17 +482,22 @@ export function tests(env, dbFilename, target) {
           },
         ])
       }
+
+      await cleanupLiveWorkers(page2)
     })
 
     if (dbFilename.startsWith('idb://')) {
       it(`idb close and delete`, async () => {
         const res = await evaluate(async () => {
+          const { PGlite } = await import(PGLITE_PATH)
+          db = await PGlite.create(dbFilename)
           await db.query('select 1;')
           await db.close()
 
           const waitForDelete = () =>
             new Promise((resolve, reject) => {
-              const req = indexedDB.deleteDatabase(dbFilename)
+              const databaseName = `/pglite/${dbFilename.slice(6)}`
+              const req = indexedDB.deleteDatabase(databaseName)
 
               req.onsuccess = () => {
                 resolve()

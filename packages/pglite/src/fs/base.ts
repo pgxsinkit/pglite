@@ -12,6 +12,16 @@ export type FsType = 'nodefs' | 'idbfs' | 'memoryfs' | 'opfs-ahp'
  */
 export interface Filesystem {
   /**
+   * Whether a sync must finish before database execution can resume.
+   */
+  readonly syncRequiresExclusiveExecution?: boolean
+
+  /**
+   * Release resources acquired before filesystem initialization failed.
+   */
+  cleanupFailedInit?(): Promise<void>
+
+  /**
    * Initiate the filesystem and return the options to pass to the emscripten module.
    */
   init(
