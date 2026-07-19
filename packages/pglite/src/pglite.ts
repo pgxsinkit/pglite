@@ -812,6 +812,16 @@ export class PGlite
       this.mod!.removeFunction(this.#pglite_socket_write)
     }
 
+    // Drain any in-flight relaxed-durability sync and perform a final strict
+    // sync before closing the filesystem. With relaxedDurability the last
+    // syncToFs() is fire-and-forget, so a sync can still be running against the
+    // filesystem here; the mutex serialises with it (waiting it out) and the
+    // strict syncToFs(false) guarantees the tail writes persist. This closes
+    // the race between an in-flight relaxed sync and closeFs() — on IdbFs the
+    // in-flight sync would otherwise open a transaction on an already-closing
+    // IDBDatabase connection.
+    await this.#fsSyncMutex.runExclusive(() => this.fs!.syncToFs(false))
+
     // Close the filesystem
     await this.fs!.closeFs()
 
