@@ -37,7 +37,11 @@ export function parseDataDir(dataDir?: string) {
   return { dataDir, fsType }
 }
 
-export async function loadFs(dataDir?: string, fsType?: FsType) {
+export async function loadFs(
+  dataDir?: string,
+  fsType?: FsType,
+  options: { debug?: boolean } = {},
+) {
   let fs: Filesystem
   if (dataDir && fsType === 'nodefs') {
     // Lazy load the nodefs to avoid bundling it in the browser
@@ -48,7 +52,7 @@ export async function loadFs(dataDir?: string, fsType?: FsType) {
   } else if (dataDir && fsType === 'opfs-ahp') {
     // Lazy load the opfs-ahp to so that it's optional in the bundle
     const { OpfsAhpFS } = await import('./opfs-ahp.js')
-    fs = new OpfsAhpFS(dataDir)
+    fs = new OpfsAhpFS(dataDir, { debug: options.debug })
   } else {
     fs = new MemoryFS()
   }

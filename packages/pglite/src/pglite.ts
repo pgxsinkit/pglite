@@ -298,7 +298,7 @@ export class PGlite
       this.fs = options.fs
     } else {
       const { dataDir, fsType } = parseDataDir(options.dataDir)
-      this.fs = await loadFs(dataDir, fsType)
+      this.fs = await loadFs(dataDir, fsType, { debug: this.debug > 0 })
     }
 
     const extensionBundlePromises: Record<string, Promise<Blob | null>> = {}

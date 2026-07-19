@@ -74,14 +74,61 @@ export class EmscriptenBuiltinFilesystem implements Filesystem {
  * Abstract base class for all custom virtual filesystems.
  * Each custom filesystem needs to implement an interface similar to the NodeJS FS API.
  */
+/**
+ * A record of a filesystem syscall that was converted into an errno result
+ * while Postgres was operating. Kept in a small ring buffer so that, when
+ * Postgres later dies (e.g. ERRORDATA_STACK_SIZE exceeded), we can see which
+ * VFS operations were failing underneath it.
+ */
+export interface SyscallError {
+  op: string
+  path: string
+  errno: number
+  message: string
+  timeMs: number
+}
+
+const MAX_SYSCALL_ERRORS = 50
+
 export abstract class BaseFilesystem implements Filesystem {
   protected dataDir?: string
   protected pg?: PGlite
   readonly debug: boolean
 
+  #recentSyscallErrors: SyscallError[] = []
+
   constructor(dataDir?: string, { debug = false }: { debug?: boolean } = {}) {
     this.dataDir = dataDir
     this.debug = debug
+  }
+
+  /**
+   * The most recent syscall failures (up to {@link MAX_SYSCALL_ERRORS}) that the
+   * emscripten FS wrapper converted into errno results. Oldest first.
+   */
+  get recentSyscallErrors(): readonly SyscallError[] {
+    return this.#recentSyscallErrors
+  }
+
+  /**
+   * Record a syscall failure into the ring buffer. Called by the emscripten FS
+   * wrapper at the point it converts a thrown error into an errno result. The
+   * allocation only happens when an error actually occurs.
+   */
+  recordSyscallError(
+    op: string,
+    path: string,
+    errno: number,
+    message: string,
+  ): void {
+    const buf = this.#recentSyscallErrors
+    buf.push({ op, path, errno, message, timeMs: Date.now() })
+    if (buf.length > MAX_SYSCALL_ERRORS) {
+      buf.shift()
+    }
+    if (this.debug) {
+      console.warn('[pglite-fs] syscall error', op, path, errno, message)
+    }
   }
 
   async syncToFs(_relaxedDurability?: boolean) {}
@@ -243,11 +290,27 @@ const createEmscriptenFS = (Module: PostgresMod, baseFS: BaseFilesystem) => {
   const FS = Module.FS as EmscriptenFS
   const log = baseFS.debug ? console.log : null
   const EMFS = {
-    tryFSOperation<T>(f: () => T): T {
+    tryFSOperation<T>(
+      f: () => T,
+      op = 'unknown',
+      path: string | (() => string) = '',
+    ): T {
       try {
         return f()
       } catch (e: any) {
         if (!e.code) throw e
+        // Record the failure before converting to an errno result. The path may
+        // be a thunk so that hot paths (read/write) don't pay for realPath()
+        // unless an error actually occurs.
+        const resolvedPath = typeof path === 'function' ? path() : path
+        const errno =
+          e.code === 'UNKNOWN' ? ERRNO_CODES.EINVAL : (e.code as number)
+        baseFS.recordSyscallError(
+          op,
+          resolvedPath,
+          typeof errno === 'number' ? errno : -1,
+          e.message ?? String(e.code),
+        )
         if (e.code === 'UNKNOWN') throw new FS.ErrnoError(ERRNO_CODES.EINVAL)
         throw new FS.ErrnoError(e.code)
       }
@@ -278,10 +341,14 @@ const createEmscriptenFS = (Module: PostgresMod, baseFS: BaseFilesystem) => {
     },
     getMode: function (path: string): number {
       log?.('getMode', path)
-      return EMFS.tryFSOperation(() => {
-        const stats = baseFS.lstat(path)
-        return stats.mode
-      })
+      return EMFS.tryFSOperation(
+        () => {
+          const stats = baseFS.lstat(path)
+          return stats.mode
+        },
+        'getMode',
+        path,
+      )
     },
     realPath: function (node: FSNode): string {
       const parts: string[] = []
@@ -297,37 +364,45 @@ const createEmscriptenFS = (Module: PostgresMod, baseFS: BaseFilesystem) => {
       getattr(node: FSNode): FS.Stats {
         log?.('getattr', EMFS.realPath(node))
         const path = EMFS.realPath(node)
-        return EMFS.tryFSOperation(() => {
-          const stats = baseFS.lstat(path)
-          return {
-            ...stats,
-            dev: 0,
-            ino: node.id,
-            nlink: 1,
-            rdev: node.rdev,
-            atime: new Date(stats.atime),
-            mtime: new Date(stats.mtime),
-            ctime: new Date(stats.ctime),
-          }
-        })
+        return EMFS.tryFSOperation(
+          () => {
+            const stats = baseFS.lstat(path)
+            return {
+              ...stats,
+              dev: 0,
+              ino: node.id,
+              nlink: 1,
+              rdev: node.rdev,
+              atime: new Date(stats.atime),
+              mtime: new Date(stats.mtime),
+              ctime: new Date(stats.ctime),
+            }
+          },
+          'getattr',
+          path,
+        )
       },
       setattr(node: FSNode, attr: FS.Stats): void {
         log?.('setattr', EMFS.realPath(node), attr)
         const path = EMFS.realPath(node)
-        EMFS.tryFSOperation(() => {
-          if (attr.mode !== undefined) {
-            baseFS.chmod(path, attr.mode)
-          }
-          if (attr.size !== undefined) {
-            baseFS.truncate(path, attr.size)
-          }
-          if (attr.timestamp !== undefined) {
-            baseFS.utimes(path, attr.timestamp, attr.timestamp)
-          }
-          if (attr.size !== undefined) {
-            baseFS.truncate(path, attr.size)
-          }
-        })
+        EMFS.tryFSOperation(
+          () => {
+            if (attr.mode !== undefined) {
+              baseFS.chmod(path, attr.mode)
+            }
+            if (attr.size !== undefined) {
+              baseFS.truncate(path, attr.size)
+            }
+            if (attr.timestamp !== undefined) {
+              baseFS.utimes(path, attr.timestamp, attr.timestamp)
+            }
+            if (attr.size !== undefined) {
+              baseFS.truncate(path, attr.size)
+            }
+          },
+          'setattr',
+          path,
+        )
       },
       lookup(parent: FSNode, name: string): FSNode {
         log?.('lookup', EMFS.realPath(parent), name)
@@ -340,22 +415,30 @@ const createEmscriptenFS = (Module: PostgresMod, baseFS: BaseFilesystem) => {
         const node = EMFS.createNode(parent, name, mode, dev)
         // create the backing node for this in the fs root as well
         const path = EMFS.realPath(node)
-        return EMFS.tryFSOperation(() => {
-          if (FS.isDir(node.mode)) {
-            baseFS.mkdir(path, { mode })
-          } else {
-            baseFS.writeFile(path, '', { mode })
-          }
-          return node
-        })
+        return EMFS.tryFSOperation(
+          () => {
+            if (FS.isDir(node.mode)) {
+              baseFS.mkdir(path, { mode })
+            } else {
+              baseFS.writeFile(path, '', { mode })
+            }
+            return node
+          },
+          'mknod',
+          path,
+        )
       },
       rename(oldNode: FSNode, newDir: FSNode, newName: string): void {
         log?.('rename', EMFS.realPath(oldNode), EMFS.realPath(newDir), newName)
         const oldPath = EMFS.realPath(oldNode)
         const newPath = [EMFS.realPath(newDir), newName].join('/')
-        EMFS.tryFSOperation(() => {
-          baseFS.rename(oldPath, newPath)
-        })
+        EMFS.tryFSOperation(
+          () => {
+            baseFS.rename(oldPath, newPath)
+          },
+          'rename',
+          oldPath,
+        )
         oldNode.name = newName
       },
       unlink(parent: FSNode, name: string): void {
@@ -364,22 +447,39 @@ const createEmscriptenFS = (Module: PostgresMod, baseFS: BaseFilesystem) => {
         try {
           baseFS.unlink(path)
         } catch (e: any) {
-          // no-op
+          // Behavior preserved: unlink failures are swallowed (no-op), but we
+          // still record them so the ring buffer sees them.
+          if (e?.code) {
+            baseFS.recordSyscallError(
+              'unlink',
+              path,
+              typeof e.code === 'number' ? e.code : -1,
+              e.message ?? String(e.code),
+            )
+          }
         }
       },
       rmdir(parent: FSNode, name: string): void {
         log?.('rmdir', EMFS.realPath(parent), name)
         const path = [EMFS.realPath(parent), name].join('/')
-        return EMFS.tryFSOperation(() => {
-          baseFS.rmdir(path)
-        })
+        return EMFS.tryFSOperation(
+          () => {
+            baseFS.rmdir(path)
+          },
+          'rmdir',
+          path,
+        )
       },
       readdir(node: FSNode): string[] {
         log?.('readdir', EMFS.realPath(node))
         const path = EMFS.realPath(node)
-        return EMFS.tryFSOperation(() => {
-          return baseFS.readdir(path)
-        })
+        return EMFS.tryFSOperation(
+          () => {
+            return baseFS.readdir(path)
+          },
+          'readdir',
+          path,
+        )
       },
       symlink(parent: FSNode, newName: string, oldPath: string): void {
         log?.('symlink', EMFS.realPath(parent), newName, oldPath)
@@ -396,24 +496,32 @@ const createEmscriptenFS = (Module: PostgresMod, baseFS: BaseFilesystem) => {
       open(stream: FSStream): void {
         log?.('open stream', EMFS.realPath(stream.node))
         const path = EMFS.realPath(stream.node)
-        return EMFS.tryFSOperation(() => {
-          if (FS.isFile(stream.node.mode)) {
-            stream.shared.refcount = 1
-            stream.nfd = baseFS.open(path)
-          }
-        })
+        return EMFS.tryFSOperation(
+          () => {
+            if (FS.isFile(stream.node.mode)) {
+              stream.shared.refcount = 1
+              stream.nfd = baseFS.open(path)
+            }
+          },
+          'open',
+          path,
+        )
       },
       close(stream: FSStream): void {
         log?.('close stream', EMFS.realPath(stream.node))
-        return EMFS.tryFSOperation(() => {
-          if (
-            FS.isFile(stream.node.mode) &&
-            stream.nfd &&
-            --stream.shared.refcount === 0
-          ) {
-            baseFS.close(stream.nfd)
-          }
-        })
+        return EMFS.tryFSOperation(
+          () => {
+            if (
+              FS.isFile(stream.node.mode) &&
+              stream.nfd &&
+              --stream.shared.refcount === 0
+            ) {
+              baseFS.close(stream.nfd)
+            }
+          },
+          'close',
+          () => EMFS.realPath(stream.node),
+        )
       },
       dup(stream: FSStream) {
         log?.('dup stream', EMFS.realPath(stream.node))
@@ -434,14 +542,17 @@ const createEmscriptenFS = (Module: PostgresMod, baseFS: BaseFilesystem) => {
           position,
         )
         if (length === 0) return 0
-        const ret = EMFS.tryFSOperation(() =>
-          baseFS.read(
-            stream.nfd!,
-            buffer as unknown as Uint8Array,
-            offset,
-            length,
-            position,
-          ),
+        const ret = EMFS.tryFSOperation(
+          () =>
+            baseFS.read(
+              stream.nfd!,
+              buffer as unknown as Uint8Array,
+              offset,
+              length,
+              position,
+            ),
+          'read',
+          () => EMFS.realPath(stream.node),
         )
         return ret
       },
@@ -459,14 +570,17 @@ const createEmscriptenFS = (Module: PostgresMod, baseFS: BaseFilesystem) => {
           length,
           position,
         )
-        return EMFS.tryFSOperation(() =>
-          baseFS.write(
-            stream.nfd!,
-            buffer.buffer as unknown as Uint8Array,
-            offset,
-            length,
-            position,
-          ),
+        return EMFS.tryFSOperation(
+          () =>
+            baseFS.write(
+              stream.nfd!,
+              buffer.buffer as unknown as Uint8Array,
+              offset,
+              length,
+              position,
+            ),
+          'write',
+          () => EMFS.realPath(stream.node),
         )
       },
       llseek(stream: FSStream, offset: number, whence: number): number {
@@ -476,10 +590,14 @@ const createEmscriptenFS = (Module: PostgresMod, baseFS: BaseFilesystem) => {
           position += stream.position
         } else if (whence === 2) {
           if (FS.isFile(stream.node.mode)) {
-            EMFS.tryFSOperation(() => {
-              const stat = baseFS.fstat(stream.nfd!)
-              position += stat.size
-            })
+            EMFS.tryFSOperation(
+              () => {
+                const stat = baseFS.fstat(stream.nfd!)
+                position += stat.size
+              },
+              'llseek',
+              () => EMFS.realPath(stream.node),
+            )
           }
         }
         if (position < 0) {

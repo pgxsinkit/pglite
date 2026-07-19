@@ -120,16 +120,46 @@ export class OpfsAhpFS extends BaseFilesystem {
   }
 
   async closeFs(): Promise<void> {
+    this.#trace('closeFs: start', `${this.#sh.size} handles`)
     for (const sh of this.#sh.values()) {
       sh.close()
     }
     this.#stateSH.flush()
     this.#stateSH.close()
     this.pg!.Module.FS.quit()
+    this.#trace('closeFs: complete')
+  }
+
+  /**
+   * Gated debug trace. Zero-cost when `debug` is off (single boolean check).
+   */
+  #trace(...args: unknown[]): void {
+    if (this.debug) {
+      console.log('[opfs-ahp]', ...args)
+    }
+  }
+
+  /**
+   * Wrap an underlying error into a catchable Error whose message names the
+   * failing operation, preserving the original as `cause` (target is ES2020, so
+   * the cause is attached manually rather than via the constructor option).
+   */
+  #wrapError(message: string, cause: unknown): Error {
+    const err = new Error(
+      `${message}: ${(cause as Error)?.message ?? cause}`,
+    ) as Error & { cause?: unknown }
+    err.cause = cause
+    return err
   }
 
   async #init() {
+    const t0 = Date.now()
+    const since = () => `+${Date.now() - t0}ms`
+    this.#trace('init: start', `dataDir=${this.dataDir}`)
+
     this.#opfsRootAh = await navigator.storage.getDirectory()
+    this.#trace('init: OPFS root acquired', since())
+
     this.#rootAh = await this.#resolveOpfsDirectory(this.dataDir!, {
       create: true,
     })
@@ -137,13 +167,16 @@ export class OpfsAhpFS extends BaseFilesystem {
       from: this.#rootAh,
       create: true,
     })
+    this.#trace('init: dataDir resolved', since())
 
     this.#stateFH = await this.#rootAh.getFileHandle(STATE_FILE, {
       create: true,
     })
     this.#stateSH = await (this.#stateFH as any).createSyncAccessHandle()
+    const stateSize = this.#stateSH.getSize()
+    this.#trace('init: state file opened', `${stateSize} bytes`, since())
 
-    const stateAB = new ArrayBuffer(this.#stateSH.getSize())
+    const stateAB = new ArrayBuffer(stateSize)
     this.#stateSH.read(stateAB, { at: 0 })
     let state: State
     const stateLines = new TextDecoder().decode(stateAB).split('\n')
@@ -171,26 +204,41 @@ export class OpfsAhpFS extends BaseFilesystem {
       isNewState = true
     }
     this.state = state
+    this.#trace('init: state parsed', isNewState ? 'new' : 'existing', since())
 
     // Apply WAL entries
     const wal = stateLines
       .slice(1)
       .filter(Boolean)
       .map((line) => JSON.parse(line))
+    let walApplied = 0
+    let walFailed = 0
     for (const entry of wal) {
       const methodName = `_${entry.opp}State`
       if (typeof this[methodName as keyof this] === 'function') {
         try {
           const method = this[methodName as keyof this] as any
           method.bind(this)(...entry.args)
+          walApplied++
         } catch (e) {
+          walFailed++
+          this.#trace('init: WAL entry failed', entry.opp, e)
           console.warn('Error applying OPFS AHP WAL entry', entry, e)
         }
       }
     }
+    this.#trace(
+      'init: WAL entries applied',
+      `${walApplied} applied, ${walFailed} failed`,
+      since(),
+    )
 
-    // Open all file handles for dir tree
+    // Open all file handles for dir tree.
+    // Failures here are tolerated (the file may have vanished) but counted, and
+    // routed through the trace helper rather than swallowed silently.
     const walkPromises: Promise<void>[] = []
+    let filesOpened = 0
+    let filesFailed = 0
     const walk = async (node: Node) => {
       if (node.type === 'file') {
         try {
@@ -199,10 +247,15 @@ export class OpfsAhpFS extends BaseFilesystem {
             fh as any
           ).createSyncAccessHandle()
           this.#fh.set(node.backingFilename, fh)
-
           this.#sh.set(node.backingFilename, sh)
+          filesOpened++
         } catch (e) {
-          console.error('Error opening file handle for node', node, e)
+          filesFailed++
+          this.#trace(
+            'init: failed to open file handle',
+            node.backingFilename,
+            e,
+          )
         }
       } else {
         for (const child of Object.values(node.children)) {
@@ -211,81 +264,141 @@ export class OpfsAhpFS extends BaseFilesystem {
       }
     }
     await walk(this.state.root)
-
-    // Open all pool file handles
-    const poolPromises: Promise<void>[] = []
-    for (const filename of this.state.pool) {
-      poolPromises.push(
-        // eslint-disable-next-line no-async-promise-executor
-        new Promise<void>(async (resolve) => {
-          if (this.#fh.has(filename)) {
-            console.warn('File handle already exists for pool file', filename)
-          }
-          const fh = await this.#dataDirAh.getFileHandle(filename)
-          const sh: FileSystemSyncAccessHandle = await (
-            fh as any
-          ).createSyncAccessHandle()
-          this.#fh.set(filename, fh)
-          this.#sh.set(filename, sh)
-          resolve()
-        }),
+    await Promise.all(walkPromises)
+    if (filesFailed > 0) {
+      console.warn(
+        `[opfs-ahp] init: failed to open ${filesFailed} file handle(s) during tree walk`,
       )
     }
+    this.#trace(
+      'init: tree walk complete',
+      `${filesOpened} opened, ${filesFailed} failed`,
+      since(),
+    )
 
-    await Promise.all([...walkPromises, ...poolPromises])
+    // Open all pool file handles. Unlike the tree walk, a failure here is fatal
+    // and must propagate so that #init rejects with a catchable error naming the
+    // operation and filename (rather than wedging forever).
+    const poolPromises = this.state.pool.map((filename) =>
+      this.#openPoolHandle(filename),
+    )
+    await Promise.all(poolPromises)
+    this.#trace('init: pool handles opened', poolPromises.length, since())
 
     await this.maintainPool(
       isNewState ? this.initialPoolSize : this.maintainedPoolSize,
     )
+    this.#trace('init: complete', `total ${Date.now() - t0}ms`)
+  }
+
+  /**
+   * Open a single pool file's handle. Errors PROPAGATE (reject) with a message
+   * naming the operation and filename, so a failure surfaces as a real,
+   * catchable error instead of an unhandled rejection that wedges Promise.all.
+   */
+  async #openPoolHandle(filename: string): Promise<void> {
+    if (this.#fh.has(filename)) {
+      this.#trace('pool file handle already exists', filename)
+      console.warn('File handle already exists for pool file', filename)
+    }
+    try {
+      const fh = await this.#dataDirAh.getFileHandle(filename)
+      const sh: FileSystemSyncAccessHandle = await (
+        fh as any
+      ).createSyncAccessHandle()
+      this.#fh.set(filename, fh)
+      this.#sh.set(filename, sh)
+    } catch (e) {
+      throw this.#wrapError(
+        `opfs-ahp: failed to open pool handle "${filename}"`,
+        e,
+      )
+    }
   }
 
   async maintainPool(size?: number) {
     size = size || this.maintainedPoolSize
     const change = size - this.state.pool.length
+    this.#trace(
+      'maintainPool: start',
+      `pool=${this.state.pool.length}`,
+      `target=${size}`,
+      change >= 0 ? `creating ${change}` : `deleting ${-change}`,
+    )
     const promises: Promise<void>[] = []
+    // 100+ sequential createSyncAccessHandle calls is where the field wedge
+    // lives, so emit a progress tick every 25 completions.
+    const toCreate = Math.max(0, change)
+    let created = 0
     for (let i = 0; i < change; i++) {
       promises.push(
-        // eslint-disable-next-line no-async-promise-executor
-        new Promise<void>(async (resolve) => {
-          ++this.poolCounter
-          const filename = `${(Date.now() - 1704063600).toString(16).padStart(8, '0')}-${this.poolCounter.toString(16).padStart(8, '0')}`
-          const fh = await this.#dataDirAh.getFileHandle(filename, {
-            create: true,
-          })
-          const sh: FileSystemSyncAccessHandle = await (
-            fh as any
-          ).createSyncAccessHandle()
-          this.#fh.set(filename, fh)
-          this.#sh.set(filename, sh)
-          this.#logWAL({
-            opp: 'createPoolFile',
-            args: [filename],
-          })
-          this.state.pool.push(filename)
-          resolve()
+        this.#createPoolFile().then(() => {
+          created++
+          if (created % 25 === 0 || created === toCreate) {
+            this.#trace('maintainPool: created', `${created}/${toCreate}`)
+          }
         }),
       )
     }
     for (let i = 0; i > change; i--) {
-      promises.push(
-        // eslint-disable-next-line no-async-promise-executor
-        new Promise<void>(async (resolve) => {
-          const filename = this.state.pool.pop()!
-          this.#logWAL({
-            opp: 'deletePoolFile',
-            args: [filename],
-          })
-          const fh = this.#fh.get(filename)!
-          const sh = this.#sh.get(filename)
-          sh?.close()
-          await this.#dataDirAh.removeEntry(fh.name)
-          this.#fh.delete(filename)
-          this.#sh.delete(filename)
-          resolve()
-        }),
-      )
+      promises.push(this.#deletePoolFile())
     }
     await Promise.all(promises)
+    this.#trace('maintainPool: complete')
+  }
+
+  /**
+   * Create a single pool file and open its sync access handle. Errors PROPAGATE
+   * with a message naming the operation and filename.
+   */
+  async #createPoolFile(): Promise<void> {
+    ++this.poolCounter
+    const filename = `${(Date.now() - 1704063600).toString(16).padStart(8, '0')}-${this.poolCounter.toString(16).padStart(8, '0')}`
+    try {
+      const fh = await this.#dataDirAh.getFileHandle(filename, {
+        create: true,
+      })
+      const sh: FileSystemSyncAccessHandle = await (
+        fh as any
+      ).createSyncAccessHandle()
+      this.#fh.set(filename, fh)
+      this.#sh.set(filename, sh)
+      this.#logWAL({
+        opp: 'createPoolFile',
+        args: [filename],
+      })
+      this.state.pool.push(filename)
+    } catch (e) {
+      throw this.#wrapError(
+        `opfs-ahp: failed to create pool file "${filename}"`,
+        e,
+      )
+    }
+  }
+
+  /**
+   * Remove a single pool file and close its handle. Errors PROPAGATE with a
+   * message naming the operation and filename.
+   */
+  async #deletePoolFile(): Promise<void> {
+    const filename = this.state.pool.pop()!
+    this.#logWAL({
+      opp: 'deletePoolFile',
+      args: [filename],
+    })
+    const fh = this.#fh.get(filename)!
+    const sh = this.#sh.get(filename)
+    try {
+      sh?.close()
+      await this.#dataDirAh.removeEntry(fh.name)
+      this.#fh.delete(filename)
+      this.#sh.delete(filename)
+    } catch (e) {
+      throw this.#wrapError(
+        `opfs-ahp: failed to delete pool file "${filename}"`,
+        e,
+      )
+    }
   }
 
   _createPoolFileState(filename: string) {
@@ -306,11 +419,13 @@ export class OpfsAhpFS extends BaseFilesystem {
   }
 
   async checkpointState() {
+    this.#trace('checkpointState: start', `pool=${this.state.pool.length}`)
     const stateAB = new TextEncoder().encode(JSON.stringify(this.state))
     this.#stateSH.truncate(0)
     this.#stateSH.write(stateAB, { at: 0 })
     this.#stateSH.flush()
     this.lastCheckpoint = Date.now()
+    this.#trace('checkpointState: complete', `${stateAB.length} bytes`)
   }
 
   flush() {
