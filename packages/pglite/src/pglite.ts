@@ -1329,7 +1329,9 @@ export class PGlite
         }
       }
     } else if (this.#relaxedDurability) {
-      void doSync()
+      void doSync().catch((error) => {
+        this.#fsSyncFailure ??= { error }
+      })
     } else {
       try {
         await doSync()
