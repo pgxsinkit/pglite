@@ -512,18 +512,26 @@ export abstract class BasePGlite
 
       try {
         const result = await callback(tx)
+        // Clear the flag before the terminal statement so #runExec ends the
+        // transaction with the same syncToFs() as any top-level exec —
+        // otherwise a committed transaction is not persisted (or scheduled
+        // for persistence) until some later unrelated query runs.
+        this.#inTransaction = false
         if (!closed) {
           closed = true
           await this.#runExec('COMMIT')
+        } else {
+          // The transaction was closed by an explicit tx.rollback(), which
+          // ran under the in-transaction gate; sync its result now.
+          await this.syncToFs()
         }
-        this.#inTransaction = false
         return result
       } catch (e) {
+        this.#inTransaction = false
         if (!closed) {
           closed = true
           await this.#runExec('ROLLBACK')
         }
-        this.#inTransaction = false
         throw e
       }
     })
