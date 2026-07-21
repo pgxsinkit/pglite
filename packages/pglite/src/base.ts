@@ -531,6 +531,18 @@ export abstract class BasePGlite
         if (!closed) {
           closed = true
           await this.#runExec('ROLLBACK')
+        } else {
+          // The transaction already ended without reaching a sync: either an
+          // explicit tx.rollback() ran under the in-transaction gate, or the
+          // terminal COMMIT threw before #runExec reached its syncToFs().
+          // Still end at an awaited sync boundary, but never mask the
+          // original error with a sync failure — a failing filesystem
+          // surfaces again on the next operation's own sync.
+          try {
+            await this.syncToFs()
+          } catch {
+            // the original error takes precedence
+          }
         }
         throw e
       }
