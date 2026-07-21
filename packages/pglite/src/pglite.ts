@@ -1121,7 +1121,15 @@ export class PGlite
     message: Uint8Array,
     { syncToFs = true }: ExecProtocolOptions = {},
   ) {
-    await this.#waitForPendingFsSync()
+    // Await ONLY when a sync is actually pending: consumers drive this from
+    // synchronous WASM callbacks (pglite-tools' pg_dump socket bridge) where
+    // the microtask queue cannot drain, so the protocol execution below must
+    // stay inside the synchronous prefix of this call whenever possible.
+    if (this.#pendingFsSync !== undefined) {
+      await this.#waitForPendingFsSync()
+    } else if (this.#fsSyncFailure) {
+      throw this.#fsSyncFailure.error
+    }
     const data = this.execProtocolRawSync(message)
     if (syncToFs) {
       await this.syncToFs()
@@ -1144,7 +1152,15 @@ export class PGlite
     message: Uint8Array,
     { syncToFs = true, onRawData }: ExecProtocolOptionsStream,
   ) {
-    await this.#waitForPendingFsSync()
+    // Same synchronous-prefix contract as execProtocolRaw: pglite-tools'
+    // pg_dump write callback invokes this from inside a blocking callMain and
+    // reads the streamed bytes back synchronously — an unconditional await
+    // here starves it (microtasks cannot run) and pg_dump sees a dead server.
+    if (this.#pendingFsSync !== undefined) {
+      await this.#waitForPendingFsSync()
+    } else if (this.#fsSyncFailure) {
+      throw this.#fsSyncFailure.error
+    }
     this.#onData = (bytes: Uint8Array) => {
       onRawData(bytes)
       return bytes.length
@@ -1333,12 +1349,14 @@ export class PGlite
         this.#fsSyncFailure ??= { error }
       })
     } else {
-      try {
-        await doSync()
-      } catch (error) {
-        this.#fsSyncFailure ??= { error }
-        throw error
-      }
+      // Awaited, non-exclusive: plain upstream semantics — the failure
+      // propagates to the caller and the filesystem stays reachable, so a
+      // stateful VFS delivers its OWN failure policy on later calls. Latching
+      // here would replay this error at the next syncToFs() and shadow that
+      // policy (observed: it masked pglite-opfs-repacked's StoreFailedError
+      // poison contract). The latch exists for lanes that cannot report any
+      // other way: detached relaxed syncs and the exclusive-execution lane.
+      await doSync()
     }
   }
 
