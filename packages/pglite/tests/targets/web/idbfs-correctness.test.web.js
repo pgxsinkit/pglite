@@ -164,7 +164,12 @@ describe('IDBFS correctness', () => {
     expect(result.deletionBlocked).toBe(false)
   })
 
-  it('does not run the next query while a relaxed sync is taking its snapshot', async () => {
+  // Relaxed IDBFS deliberately does NOT serialize queries behind an in-flight
+  // snapshot: doing so made every operation pay the whole-FS IndexedDB
+  // snapshot latency (measured relaxed == strict at ~80ms/op, reads included).
+  // The price is upstream's documented loss window — a crash mid-snapshot can
+  // lose the tail — which is what relaxedDurability has always meant here.
+  it('runs the next query concurrently while a relaxed sync is taking its snapshot', async () => {
     const result = await page.evaluate(
       async ({ pglitePath }) => {
         const { PGlite } = await import(pglitePath)
@@ -208,27 +213,6 @@ describe('IDBFS correctness', () => {
         await new Promise((resolve) => setTimeout(resolve, 50))
         const completedBeforeRelease = secondQueryFinished
 
-        const captureError = (operation) => {
-          try {
-            operation()
-            return null
-          } catch (error) {
-            return error instanceof Error ? error.message : String(error)
-          }
-        }
-        const rawSyncError = captureError(() =>
-          db.execProtocolRawSync(new Uint8Array([88])),
-        )
-        const originalCallMain = db.Module.callMain
-        db.Module.callMain = () => {
-          throw new Error('callMain reached module')
-        }
-        const callMainError = captureError(() => db.callMain([]))
-        db.Module.callMain = originalCallMain
-        const copyToFSError = captureError(() =>
-          db.copyToFS('/tmp/pending-sync-test', new Uint8Array([1])),
-        )
-
         releaseRemoteSet()
         await secondQuery
         await db.close()
@@ -243,18 +227,12 @@ describe('IDBFS correctness', () => {
 
         return {
           completedBeforeRelease,
-          rawSyncError,
-          callMainError,
-          copyToFSError,
         }
       },
       { pglitePath },
     )
 
-    expect(result.completedBeforeRelease).toBe(false)
-    expect(result.rawSyncError).toMatch(/sync is pending/)
-    expect(result.callMainError).toMatch(/sync is pending/)
-    expect(result.copyToFSError).toMatch(/sync is pending/)
+    expect(result.completedBeforeRelease).toBe(true)
   })
 
   it('does not complete a strict sync until the MEMFS timestamp can advance', async () => {
@@ -288,11 +266,6 @@ describe('IDBFS correctness', () => {
         Date.now = () => now
 
         let completedBeforeClockAdvance
-        let rawSyncError
-        let callMainError
-        let copyToFSError
-        let asyncRawCompletedBeforeClockAdvance
-        let explicitSyncCompletedBeforeClockAdvance
         try {
           let queryFinished = false
           const query = db.exec('INSERT INTO test VALUES (1)').then(() => {
@@ -302,44 +275,8 @@ describe('IDBFS correctness', () => {
           await new Promise((resolve) => setTimeout(resolve, 0))
           completedBeforeClockAdvance = queryFinished
 
-          const captureError = (operation) => {
-            try {
-              operation()
-              return null
-            } catch (error) {
-              return error instanceof Error ? error.message : String(error)
-            }
-          }
-          rawSyncError = captureError(() =>
-            db.execProtocolRawSync(new Uint8Array([88])),
-          )
-          const originalCallMain = db.Module.callMain
-          db.Module.callMain = () => {
-            throw new Error('callMain reached module')
-          }
-          callMainError = captureError(() => db.callMain([]))
-          db.Module.callMain = originalCallMain
-          copyToFSError = captureError(() =>
-            db.copyToFS('/tmp/strict-sync-test', new Uint8Array([1])),
-          )
-          let asyncRawFinished = false
-          const asyncRaw = db
-            .execProtocolRaw(new Uint8Array([88]), { syncToFs: false })
-            .then(() => {
-              asyncRawFinished = true
-            })
-          let explicitSyncFinished = false
-          const explicitSync = db.syncToFs().then(() => {
-            explicitSyncFinished = true
-          })
-          await new Promise((resolve) => setTimeout(resolve, 0))
-          asyncRawCompletedBeforeClockAdvance = asyncRawFinished
-          explicitSyncCompletedBeforeClockAdvance = explicitSyncFinished
-
           now += 1
           await query
-          await asyncRaw
-          await explicitSync
         } finally {
           // A frozen clock outlives this test's failure and poisons every
           // later test in the page — always restore it.
@@ -361,23 +298,17 @@ describe('IDBFS correctness', () => {
 
         return {
           completedBeforeClockAdvance,
-          rawSyncError,
-          callMainError,
-          copyToFSError,
-          asyncRawCompletedBeforeClockAdvance,
-          explicitSyncCompletedBeforeClockAdvance,
           persisted,
         }
       },
       { pglitePath },
     )
 
+    // The strict query itself awaits its sync inline, so the mtime-tick gate
+    // in #syncFs holds it until the clock can advance — no exclusive-execution
+    // machinery involved. (The former "sync is pending" probes asserted that
+    // machinery; it is intentionally not engaged for IDBFS any more.)
     expect(result.completedBeforeClockAdvance).toBe(false)
-    expect(result.rawSyncError).toMatch(/sync is pending/)
-    expect(result.callMainError).toMatch(/sync is pending/)
-    expect(result.copyToFSError).toMatch(/sync is pending/)
-    expect(result.asyncRawCompletedBeforeClockAdvance).toBe(false)
-    expect(result.explicitSyncCompletedBeforeClockAdvance).toBe(false)
     expect(result.persisted[0].rows).toEqual([{ value: 1 }])
   })
 
@@ -396,16 +327,29 @@ describe('IDBFS correctness', () => {
         const fs = db.Module.FS
         const originalSyncfs = fs.syncfs.bind(fs)
         let failNextSync = true
+        let notifyFailureDelivered
+        const failureDelivered = new Promise((resolve) => {
+          notifyFailureDelivered = resolve
+        })
         fs.syncfs = (populate, callback) => {
           if (!populate && failNextSync) {
             failNextSync = false
-            queueMicrotask(() => callback(new Error('forced sync failure')))
+            queueMicrotask(() => {
+              callback(new Error('forced sync failure'))
+              notifyFailureDelivered()
+            })
           } else {
             originalSyncfs(populate, callback)
           }
         }
 
         await db.exec('INSERT INTO test VALUES (1)')
+        // The failing sync is detached (it may still be queued behind an
+        // earlier in-flight snapshot); the latch delivers on the first public
+        // operation AFTER the rejection has settled — wait for the delivery,
+        // then a macrotask for it to propagate to the latch.
+        await failureDelivered
+        await new Promise((resolve) => setTimeout(resolve, 0))
         let queryError = null
         try {
           await db.exec('SELECT * FROM test')
@@ -443,8 +387,6 @@ describe('IDBFS correctness', () => {
         const databaseName = '/pglite/extension-close-failure-test'
         let finalSyncRequested = false
         let atexitCalled = false
-        let previousSyncFinished = false
-        let hookRanBeforePreviousSyncFinished = false
         let syncDuringCloseError = null
         const db = await PGlite.create({
           dataDir,
@@ -453,7 +395,6 @@ describe('IDBFS correctness', () => {
             failing: {
               setup: async (pg) => ({
                 close: async () => {
-                  hookRanBeforePreviousSyncFinished = !previousSyncFinished
                   try {
                     await pg.syncToFs()
                   } catch (error) {
@@ -488,7 +429,6 @@ describe('IDBFS correctness', () => {
             if (!populate && delayNextSync) {
               delayNextSync = false
               setTimeout(() => {
-                previousSyncFinished = true
                 callback(error)
               }, 50)
             } else {
@@ -527,7 +467,6 @@ describe('IDBFS correctness', () => {
           closeError,
           finalSyncRequested,
           atexitCalled,
-          hookRanBeforePreviousSyncFinished,
           syncDuringCloseError,
           syncAfterCloseError,
         }
@@ -538,7 +477,6 @@ describe('IDBFS correctness', () => {
     expect(result.closeError).toBe('forced extension close failure')
     expect(result.finalSyncRequested).toBe(true)
     expect(result.atexitCalled).toBe(true)
-    expect(result.hookRanBeforePreviousSyncFinished).toBe(false)
     expect(result.syncDuringCloseError).toBe('PGlite is closing')
     expect(result.syncAfterCloseError).toBe('PGlite is closed')
   })

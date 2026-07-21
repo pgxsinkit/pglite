@@ -4,7 +4,12 @@ import { PGlite } from '../pglite.js'
 import { PGDATA, PG_ROOT } from '../initdb.js'
 
 export class IdbFs extends EmscriptenBuiltinFilesystem {
-  readonly syncRequiresExclusiveExecution = true
+  // Deliberately NOT syncRequiresExclusiveExecution: the exclusive lane makes
+  // every query wait out any in-flight whole-FS IndexedDB snapshot, which
+  // destroys relaxed durability (measured: relaxed == strict at ~80ms/op, and
+  // read latency inherits write-snapshot latency). Relaxed IDBFS keeps
+  // upstream's contract instead — background snapshots race queries, and a
+  // crash during a snapshot can lose the tail — the documented loss window.
   #releaseHeldLock?: () => void
   #accessLockRequest?: Promise<void>
 
