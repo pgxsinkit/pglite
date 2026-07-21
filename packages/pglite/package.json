@@ -1,6 +1,6 @@
 {
   "name": "@pgxsinkit/pglite",
-  "version": "0.5.4-pgx.7",
+  "version": "0.5.4-pgx.8",
   "private": false,
   "publishConfig": {
     "access": "public"
@@ -132,6 +132,8 @@
     "test:integration": "pnpm test:runtimes && pnpm test:web",
     "test:clean": "rm -rf ./pgdata-test",
     "build:js": "tsup && tsx scripts/bundle-wasm.ts",
+    "publish:pgx:gh": "node scripts/publish-pgx.mjs gh",
+    "publish:pgx:npm": "node scripts/publish-pgx.mjs npm",
     "build": "pnpm build:js",
     "dev": "concurrently \"tsup --watch\" \"sleep 1 && tsx scripts/bundle-wasm.ts\" \"pnpm dev-server\"",
     "dev-server": "pnpm http-server ../",
