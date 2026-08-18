@@ -1,6 +1,6 @@
 {
   "name": "@pgxsinkit/pglite",
-  "version": "0.5.5-pgx.1",
+  "version": "0.5.5-pgx.2",
   "private": false,
   "publishConfig": {
     "access": "public"
