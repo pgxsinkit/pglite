@@ -1,4 +1,5 @@
 export * from './pglite.js'
+export { BasePGlite } from './base.js'
 export * from './interface.js'
 export * as types from './types.js'
 export * as parse from './parse.js'
