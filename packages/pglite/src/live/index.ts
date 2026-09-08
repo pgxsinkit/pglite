@@ -77,6 +77,22 @@ const setup = async (pg: PGliteInterface, _emscriptenOpts: any) => {
       let results: LiveQueryResults<T>
 
       let unsubList: Array<(tx?: Transaction) => Promise<void>>
+
+      // `refresh` is created after `init()` has completed, but it is `init()`
+      // that registers the notification listeners which call it - a notification
+      // that arrives while `init()` is still running would hit the temporal dead
+      // zone of `refresh`. Record any such notification and replay it once
+      // `refresh` has been created.
+      let refreshReady = false
+      let refreshPending = false
+      const notifyRefresh = () => {
+        if (!refreshReady) {
+          refreshPending = true
+          return
+        }
+        refresh()
+      }
+
       const init = async () => {
         await pg.transaction(async (tx) => {
           // Create a temporary view with the query
@@ -128,7 +144,7 @@ const setup = async (pg: PGliteInterface, _emscriptenOpts: any) => {
               tx.listen(
                 `"table_change__${table.schema_oid}__${table.table_oid}"`,
                 async () => {
-                  refresh()
+                  notifyRefresh()
                 },
               ),
             ),
@@ -225,6 +241,13 @@ const setup = async (pg: PGliteInterface, _emscriptenOpts: any) => {
         },
       )
 
+      refreshReady = true
+      if (refreshPending) {
+        // A notification was received while `init()` was still running
+        refreshPending = false
+        refresh()
+      }
+
       // Function to subscribe to the query
       const subscribe = (callback: (results: Results<T>) => void) => {
         if (dead) {
@@ -309,6 +332,21 @@ const setup = async (pg: PGliteInterface, _emscriptenOpts: any) => {
       let changes: Results<Change<T>>
 
       let unsubList: Array<(tx?: Transaction) => Promise<void>>
+
+      // `refresh` is created after `init()` has completed, but it is `init()`
+      // that registers the notification listeners which call it - a notification
+      // that arrives while `init()` is still running would hit the temporal dead
+      // zone of `refresh`. Record any such notification and replay it once
+      // `refresh` has been created.
+      let refreshReady = false
+      let refreshPending = false
+      const notifyRefresh = () => {
+        if (!refreshReady) {
+          refreshPending = true
+          return
+        }
+        refresh()
+      }
 
       const init = async () => {
         await pg.transaction(async (tx) => {
@@ -421,7 +459,7 @@ const setup = async (pg: PGliteInterface, _emscriptenOpts: any) => {
               tx.listen(
                 `"table_change__${table.schema_oid}__${table.table_oid}"`,
                 async () => {
-                  refresh()
+                  notifyRefresh()
                 },
               ),
             ),
@@ -488,6 +526,8 @@ const setup = async (pg: PGliteInterface, _emscriptenOpts: any) => {
         ])
       })
 
+      refreshReady = true
+
       // Function to subscribe to the query
       const subscribe = (callback: (changes: Array<Change<T>>) => void) => {
         if (dead) {
@@ -538,6 +578,14 @@ const setup = async (pg: PGliteInterface, _emscriptenOpts: any) => {
 
       // Run the callback with the initial changes
       await refresh()
+
+      if (refreshPending) {
+        // A notification was received while `init()` was still running. It is
+        // replayed after the initial refresh above, as refreshing before it
+        // would consume the initial changes.
+        refreshPending = false
+        refresh()
+      }
 
       // Fields
       const fields = changes!.fields.filter(

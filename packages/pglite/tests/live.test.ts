@@ -1277,6 +1277,201 @@ await testEsmCjsAndDTC(async (importType) => {
         { id: 3, statement: 'PGlite is da best!' },
       ])
     })
+
+    it('handles a notification received while a live query is initialising', async () => {
+      // A live query registers its notification listeners inside the
+      // transaction that initialises it, and PGlite adds a listener callback to
+      // its dispatch table before it issues the LISTEN. A notification that
+      // arrives before that transaction has completed therefore invokes the
+      // listener callback before the live query has created the refresh
+      // function that the callback calls.
+      // It is reproduced here by having the query itself insert a row, firing
+      // the notify trigger that the same initialising transaction has just
+      // added to the table.
+      await db.exec(`
+        CREATE TABLE IF NOT EXISTS testTable (
+          id SERIAL PRIMARY KEY,
+          number INT
+        );
+
+        INSERT INTO testTable (number)
+        SELECT i*10 FROM generate_series(1, 5) i;
+
+        CREATE OR REPLACE FUNCTION notify_during_init() RETURNS INT AS $$
+        BEGIN
+          IF current_setting('live_test.notified', true) IS DISTINCT FROM 'yes' THEN
+            PERFORM set_config('live_test.notified', 'yes', false);
+            INSERT INTO testTable (number) VALUES (25);
+          END IF;
+          RETURN -1;
+        END;
+        $$ LANGUAGE plpgsql;
+      `)
+
+      // The listener callback is dispatched with `queueMicrotask`, so a failure
+      // in it surfaces as an unhandled rejection rather than as a thrown error
+      const rejections = []
+      const onUnhandledRejection = (error) => rejections.push(error)
+      process.on('unhandledRejection', onUnhandledRejection)
+
+      let updatedResults
+      const eventTarget = new EventTarget()
+
+      try {
+        const { initialResults, unsubscribe } = await db.live.query(
+          'SELECT * FROM testTable WHERE id <> notify_during_init() ORDER BY number;',
+          [],
+          (result) => {
+            updatedResults = result
+            eventTarget.dispatchEvent(new Event('change'))
+          },
+        )
+
+        // The row inserted while the query was initialising is not visible to
+        // the snapshot that the initial results were read with
+        expect(initialResults.rows).toEqual([
+          { id: 1, number: 10 },
+          { id: 2, number: 20 },
+          { id: 3, number: 30 },
+          { id: 4, number: 40 },
+          { id: 5, number: 50 },
+        ])
+
+        await Promise.race([
+          new Promise((resolve) =>
+            eventTarget.addEventListener('change', resolve, { once: true }),
+          ),
+          new Promise((resolve) => setTimeout(resolve, 1000)),
+        ])
+
+        await unsubscribe()
+      } finally {
+        process.off('unhandledRejection', onUnhandledRejection)
+      }
+
+      expect(rejections).toEqual([])
+
+      // The notification received while the query was initialising is replayed
+      // once the refresh function exists
+      expect(updatedResults.rows).toEqual([
+        { id: 1, number: 10 },
+        { id: 2, number: 20 },
+        { id: 6, number: 25 },
+        { id: 3, number: 30 },
+        { id: 4, number: 40 },
+        { id: 5, number: 50 },
+      ])
+    })
+
+    it('handles a notification received while a live changes query is initialising', async () => {
+      await db.exec(`
+        CREATE TABLE IF NOT EXISTS testTable (
+          id SERIAL PRIMARY KEY,
+          number INT
+        );
+
+        INSERT INTO testTable (number)
+        SELECT i*10 FROM generate_series(1, 5) i;
+      `)
+
+      // A live changes query only runs DDL and catalog queries while it is
+      // initialising, so a notification arriving in that window is simulated by
+      // invoking the listener callback as soon as it has been registered, which
+      // is what the notification dispatch does for a notification that rides
+      // back on a reply inside the initialising transaction.
+      const rejections = []
+      const originalListen = db.listen
+      db.listen = async (channel, callback, tx) => {
+        const unsubscribe = await originalListen.call(db, channel, callback, tx)
+        await Promise.resolve(callback('')).catch((error) =>
+          rejections.push(error),
+        )
+        return unsubscribe
+      }
+
+      let updatedChanges
+      const eventTarget = new EventTarget()
+
+      const { initialChanges, unsubscribe } = await db.live.changes(
+        'SELECT * FROM testTable ORDER BY number;',
+        [],
+        'id',
+        (changes) => {
+          updatedChanges = changes
+          eventTarget.dispatchEvent(new Event('change'))
+        },
+      )
+      db.listen = originalListen
+
+      expect(rejections).toEqual([])
+
+      // The replayed refresh does not consume the initial changes
+      expect(initialChanges).toEqual([
+        {
+          __op__: 'INSERT',
+          id: 1,
+          number: 10,
+          __after__: null,
+          __changed_columns__: [],
+        },
+        {
+          __op__: 'INSERT',
+          id: 2,
+          number: 20,
+          __after__: 1,
+          __changed_columns__: [],
+        },
+        {
+          __op__: 'INSERT',
+          id: 3,
+          number: 30,
+          __after__: 2,
+          __changed_columns__: [],
+        },
+        {
+          __op__: 'INSERT',
+          id: 4,
+          number: 40,
+          __after__: 3,
+          __changed_columns__: [],
+        },
+        {
+          __op__: 'INSERT',
+          id: 5,
+          number: 50,
+          __after__: 4,
+          __changed_columns__: [],
+        },
+      ])
+
+      // Let the refresh replayed after initialisation settle
+      await new Promise((resolve) => setTimeout(resolve, 100))
+
+      await db.exec('INSERT INTO testTable (number) VALUES (25);')
+
+      await new Promise((resolve) =>
+        eventTarget.addEventListener('change', resolve, { once: true }),
+      )
+
+      expect(updatedChanges).toEqual([
+        {
+          __op__: 'INSERT',
+          id: 6,
+          number: 25,
+          __after__: 2,
+          __changed_columns__: [],
+        },
+        {
+          __after__: 6,
+          __changed_columns__: ['__after__'],
+          __op__: 'UPDATE',
+          id: 3,
+          number: null,
+        },
+      ])
+
+      await unsubscribe()
+    })
   })
 
   it('basic live query - case sensitive table name', async () => {
