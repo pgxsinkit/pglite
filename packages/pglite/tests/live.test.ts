@@ -724,6 +724,101 @@ await testEsmCjsAndDTC(async (importType) => {
       ])
     })
 
+    it('live incremental query with a camelCase key', async () => {
+      await db.exec(`
+        CREATE TABLE IF NOT EXISTS "camel" (
+          "lexemeId" TEXT PRIMARY KEY,
+          "aidsOff" BOOLEAN NOT NULL
+        );
+      `)
+
+      let updatedResults
+      const eventTarget = new EventTarget()
+
+      const { initialResults, unsubscribe } = await db.live.incrementalQuery(
+        'SELECT "lexemeId", "aidsOff" FROM "camel" ORDER BY "lexemeId";',
+        [],
+        'lexemeId',
+        (result) => {
+          updatedResults = result
+          eventTarget.dispatchEvent(new Event('change'))
+        },
+      )
+
+      expect(initialResults.rows).toEqual([])
+
+      await db.exec(`
+        INSERT INTO "camel" ("lexemeId", "aidsOff")
+        VALUES ('alpha', true), ('beta', false);
+      `)
+
+      await new Promise((resolve) =>
+        eventTarget.addEventListener('change', resolve, { once: true }),
+      )
+
+      expect(updatedResults.rows).toEqual([
+        { lexemeId: 'alpha', aidsOff: true },
+        { lexemeId: 'beta', aidsOff: false },
+      ])
+
+      await db.exec(
+        `UPDATE "camel" SET "aidsOff" = false WHERE "lexemeId" = 'alpha';`,
+      )
+
+      await new Promise((resolve) =>
+        eventTarget.addEventListener('change', resolve, { once: true }),
+      )
+
+      expect(updatedResults.rows).toEqual([
+        { lexemeId: 'alpha', aidsOff: false },
+        { lexemeId: 'beta', aidsOff: false },
+      ])
+
+      await db.exec(`DELETE FROM "camel" WHERE "lexemeId" = 'beta';`)
+
+      await new Promise((resolve) =>
+        eventTarget.addEventListener('change', resolve, { once: true }),
+      )
+
+      expect(updatedResults.rows).toEqual([
+        { lexemeId: 'alpha', aidsOff: false },
+      ])
+
+      await unsubscribe()
+    })
+
+    it('live changes with a camelCase key', async () => {
+      await db.exec(`
+        CREATE TABLE IF NOT EXISTS "camel" (
+          "lexemeId" TEXT PRIMARY KEY,
+          "aidsOff" BOOLEAN NOT NULL
+        );
+      `)
+
+      await db.exec(`
+        INSERT INTO "camel" ("lexemeId", "aidsOff") VALUES ('alpha', true);
+      `)
+
+      const { initialChanges, unsubscribe } = await db.live.changes(
+        'SELECT "lexemeId", "aidsOff" FROM "camel" ORDER BY "lexemeId";',
+        [],
+        'lexemeId',
+        () => {},
+      )
+
+      expect(initialChanges).toEqual([
+        {
+          __op__: 'INSERT',
+          lexemeId: 'alpha',
+          aidsOff: true,
+          __after__: null,
+          __changed_columns__: [],
+        },
+      ])
+
+      await unsubscribe()
+    })
+
     it('basic live changes', async () => {
       await db.exec(`
         CREATE TABLE IF NOT EXISTS testTable (
